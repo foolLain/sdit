@@ -439,7 +439,7 @@ if __name__ == "__main__":
 
 
     parser.add_argument("--num-sampling-steps", type=int, default=250)
-    parser.add_argument("--cfg-scale",  type=float, default=7)
+    parser.add_argument("--cfg-scale",  type=float, default=1.0)
     parser.add_argument("--epochs", type=int, default=500)
     parser.add_argument("--global-batch-size", type=int, default=64)
     parser.add_argument("--global-seed", type=int, default=0)
