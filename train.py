@@ -1,18 +1,8 @@
-# Copyright (c) Meta Platforms, Inc. and affiliates.
-# All rights reserved.
-
-# This source code is licensed under the license found in the
-# LICENSE file in the root directory of this source tree.
-
-"""
-A minimal training script for DiT using PyTorch DDP.
-"""
 import os
 # os.environ['CUDA_IS_VISIABLE'] = '2'
 import shutil
 import debugpy
 import torch
-# the first flag below was False when we tested this script but True makes A100 training a lot faster:
 torch.backends.cuda.matmul.allow_tf32 = True
 torch.backends.cudnn.allow_tf32 = True
 import torch.amp
@@ -31,16 +21,11 @@ from time import time
 import argparse
 import logging
 import math
-
 from tqdm import tqdm
-
-# from models import DiT_models
 from diffusion import create_diffusion
-
 import torchvision
 from SDiT import transformer_snn
 # from SDiT_noASM import transformer_snn
-# from SDiT_ASM import transformer_snn
 from torch.cuda.amp import autocast as autocast
 # try:
 #     # 5678 is the default attach port in the VS Code debug configurations. Unless a host and port are specified, host defaults to 127.0.0.1
@@ -63,7 +48,6 @@ def update_ema(ema_model, model, decay=0.9999):
     model_params = OrderedDict(model.named_parameters())
 
     for name, param in model_params.items():
-        # TODO: Consider applying only to params that require_grad to avoid small numerical changes of pos_embed
         ema_params[name].mul_(decay).add_(param.data, alpha=1 - decay)
 
 
@@ -169,10 +153,6 @@ def main(args):
         
     else:
         logger = create_logger(None)
-    
-    # e_index=  len(glob(f"{args.results_dir}/*"))-1
-    # model_string_name = args.model.replace("/", "-")
-    # checkpoint_dir = f"{args.results_dir}/{e_index:03d}-{model_string_name}/checkpoints"
 
     # Create model:
     checkpoint_dir = broadcast_string(checkpoint_dir,0)
