@@ -58,19 +58,14 @@ def main(args):
     print(f"Starting rank={rank}, seed={seed}, world_size={dist.get_world_size()}.")
 
     # Load model:
-    # latent_size = args.image_size // 8
     latent_size = args.image_size 
 
     model = transformer_snn(input_size=args.image_size,in_channels=args.in_channels,patch_size=args.patch_size,num_classes=args.num_classes,embed_dim=args.dim,num_heads=args.heads,local_heads=args.local_heads,depths=args.depth,T=args.T,).to(device)
-    # Auto-download a pre-trained model or load a custom DiT checkpoint from train.py:
     ckpt_path = args.ckpt or f"SDiT-XL-2-{args.image_size}x{args.image_size}.pt"
     state_dict = find_model(ckpt_path)
     model.load_state_dict(state_dict,strict=True)
     model.eval()  # important!
     diffusion = create_diffusion(str(args.num_sampling_steps))
-    # vae = AutoencoderKL.from_pretrained(f"stabilityai/sd-vae-ft-{args.vae}").to(device)
-    assert args.cfg_scale >= 1.0, "In almost all cases, cfg_scale be >= 1.0"
-    using_cfg = args.cfg_scale > 1.0
 
     # Create folder to save samples:
     model_string_name = args.model.replace("/", "-")
@@ -102,11 +97,8 @@ def main(args):
         z = torch.randn(n, model.in_channels, latent_size, latent_size, device=device)
         y = torch.randint(0, args.num_classes, (n,), device=device)
 
-
-   
         model_kwargs = dict(y=y)
         sample_fn = model.forward
-
         
         # Sample images:
         samples = diffusion.p_sample_loop(
@@ -152,7 +144,6 @@ if __name__ == "__main__":
     parser.add_argument("--num-classes", type=int, default=1)
 
     # parser.add_argument('--amp',action='store_true')
-    parser.add_argument("--cfg-scale",  type=float, default=1.0)
     parser.add_argument("--num-sampling-steps", type=int, default=250)
     parser.add_argument("--global-seed", type=int, default=0)
     parser.add_argument("--tf32", action=argparse.BooleanOptionalAction, default=True,
