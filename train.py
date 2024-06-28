@@ -113,19 +113,15 @@ def center_crop_arr(pil_image, image_size):
 #################################################################################
 
 def broadcast_string(value, src, max_length=256):
-    """广播一个字符串到所有进程"""
-    # 创建一个足够大的字符缓冲区
     buffer = torch.zeros(max_length, dtype=torch.uint8,device="cuda")
     if dist.get_rank() == src:
         buffer[:len(value)] = torch.ByteTensor(list(value.encode()))
-    # 广播字节张量
     dist.broadcast(buffer, src)
-    # 解码接收到的字节
     return buffer.cpu().numpy().tobytes().decode().rstrip('\x00')
 
 def main(args):
     """
-    Trains a new DiT model.
+    Trains a new SDiT model.
     """
     assert torch.cuda.is_available(), "Training currently requires at least one GPU."
 
@@ -143,7 +139,7 @@ def main(args):
     if rank == 0:
         os.makedirs(args.results_dir, exist_ok=True)  # Make results folder (holds all experiment subfolders)
         experiment_index = len(glob(f"{args.results_dir}/*"))
-        model_string_name = args.model.replace("/", "-")  # e.g., DiT-XL/2 --> DiT-XL-2 (for naming folders)
+        model_string_name = args.model.replace("/", "-")  
         experiment_dir = f"{args.results_dir}/{experiment_index:03d}-{model_string_name}"  # Create an experiment folder
         checkpoint_dir = f"{experiment_dir}/checkpoints"  # Stores saved model checkpoints
         os.makedirs(checkpoint_dir, exist_ok=True)
@@ -163,7 +159,7 @@ def main(args):
         ckpt = torch.load(args.ckpt_dir)
         model.load_state_dict(ckpt['model'])
 
-    # Note that parameter initialization is done within the DiT constructor
+    # Note that parameter initialization is done within the SDiT constructor
     ema = deepcopy(model).to(device)  # Create an EMA of the model for use after training
     if args.load_ckpt:
         ema.load_state_dict(ckpt['ema'])
@@ -173,12 +169,10 @@ def main(args):
     sample_diffusion = create_diffusion(str(args.num_sampling_steps))
     logger.info(f"DiT Parameters: {sum(p.numel() for p in model.parameters()):,}")
 
-    # Setup optimizer (we used default Adam betas=(0.9, 0.999) and a constant learning rate of 1e-4 in our paper):
     opt = torch.optim.AdamW(model.parameters(), lr=args.lr, )
     # if args.load_ckpt:
     #     opt.load_state_dict(ckpt['opt'])
     scaler = torch.cuda.amp.GradScaler()
-    # scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(opt,T_max=20,last_epoch=-1,eta_min=1e-4)
 
     # Setup data:
     SetRange = torchvision.transforms.Lambda(lambda X: 2 * X - 1.)
@@ -213,7 +207,6 @@ def main(args):
     elif args.dataset == "fmnist":
         dataset = torchvision.datasets.FashionMNIST(root=args.data_path,train=True,transform=FMNIST_transform,download=False)
     elif args.dataset == "cifar10":
-        # dataset = torchvision.datasets.CIFAR10(root=args.data_path,train=True,transform=CIFAR10_transform,download=False)
         dataset = torchvision.datasets.ImageFolder(root="/HDD/data/cifar10", transform=CIFAR10_transform)
     elif args.dataset == "TinyImageNet":
         dataset = torchvision.datasets.ImageFolder(root=args.data_path, transform=TinyImageNet_transform)
@@ -302,7 +295,7 @@ def main(args):
                 log_steps = 0
                 start_time = time()
 
-            # Save DiT checkpoint:
+            # Save checkpoint:
             if train_steps % args.ckpt_every == 0 and train_steps > 0:
                 if rank == 0:
                     save_ckpt(checkpoint_dir,train_steps,rank,model,ema,opt,args,epoch,logger)
@@ -333,7 +326,7 @@ def save_ckpt(checkpoint_dir,train_steps,rank,model,ema,opt,args,epoch,logger):
 
 def sample_step(model,diffusion,checkpoint_dir,num_samples,device,rank,args):
 
-    model.eval()  # important!
+    model.eval() 
     using_cfg = args.cfg_scale > 1.0
     # Create folder to save samples:
     model_string_name = args.model.replace("/", "-")
@@ -396,7 +389,6 @@ def sample_step(model,diffusion,checkpoint_dir,num_samples,device,rank,args):
         total += global_batch_size
 
 if __name__ == "__main__":
-    # Default args here will train DiT-XL/2 with the hyperparameters we used in our paper (except training iters).
     parser = argparse.ArgumentParser()
     parser.add_argument("--dataset", type=str,default="MNIST")
     parser.add_argument("--data-path", type=str,default="/HDD/dataset/")
