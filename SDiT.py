@@ -1,10 +1,7 @@
 import torch
 import torch.nn as nn
-from spikingjelly.clock_driven.neuron import  MultiStepLIFNode,MultiStepIFNode
+from spikingjelly.activation_based.neuron import  LIFNode
 # from spikingjelly.activation_based.neuron import LIFNode
-from timm.models.layers import  trunc_normal_
-from torch.nn.init import kaiming_normal_
-import transformers
 from typing import Optional, Tuple
 import math
 from spikingjelly.clock_driven.functional import reset_net
@@ -12,6 +9,9 @@ import numpy as np
 
 def modulate(x, shift, scale):
     return x * (1 + scale.unsqueeze(1)) + shift.unsqueeze(1)
+
+
+
 
 class RMSNorm(torch.nn.Module):
     def __init__(self, dim: int, eps: float = 1e-6):
@@ -153,21 +153,20 @@ def apply_rotary_emb(
     xk_out = torch.view_as_real(xk_ * freqs_cis).flatten(3)
     return xq_out.type_as(xq), xk_out.type_as(xk)
 
+
 class MLP(nn.Module):
-    def __init__(self, dim,  enable_amp=False):
+    def __init__(self, dim):
         super().__init__()
-        self.mlp1_lif = MultiStepLIFNode(decay_input=False,v_reset=0.,detach_reset=True, backend='cupy',)
-        self.mlp1 = nn.Linear(dim,dim,bias=False)
+        self.mlp1_lif = LIFNode(v_reset=0.,detach_reset=True, backend='torch',decay_input=False)
+        self.mlp1 = nn.Linear(dim,dim*4,bias=False)
 
-        self.mlp2_lif = MultiStepLIFNode(decay_input=False,v_reset=0.,detach_reset=True, backend='cupy',)
-        self.mlp2 = nn.Linear(dim,dim,bias=False)
+        self.mlp2_lif = LIFNode(v_reset=0.,detach_reset=True, backend='torch',decay_input=False)
+        self.mlp2 = nn.Linear(dim,dim*4,bias=False)
 
-        self.mlp3_lif = MultiStepLIFNode(decay_input=False,v_reset=0.,detach_reset=True, backend='cupy',)
-        self.mlp3 = nn.Linear(dim,dim,bias=False)
+        self.mlp3_lif = LIFNode(v_reset=0.,detach_reset=True, backend='torch',decay_input=False)
+        self.mlp3 = nn.Linear(dim*4,dim,bias=False)
 
-        self.enable_amp = enable_amp
-
-    def inner_forward(self, x):
+    def forward(self, x):
         T, B, C, N = x.shape
         y1 = self.mlp1_lif(x)
         y1 = self.mlp1(y1)
@@ -176,12 +175,9 @@ class MLP(nn.Module):
         x = self.mlp3(y1*self.mlp3_lif(y2))
         return x
 
-    def forward(self, x):
-        with torch.cuda.amp.autocast(enabled=self.enable_amp):
-            return self.inner_forward(x)
 
 class SpikingSelfAttention(nn.Module):
-    def __init__(self, dim, num_heads=8, local_heads=2,enable_amp=False):
+    def __init__(self, dim, num_heads=8, local_heads=2):
         super().__init__()
         assert dim % num_heads == 0, f"dim {dim} should be divided by num_heads {num_heads}."
 
@@ -189,25 +185,27 @@ class SpikingSelfAttention(nn.Module):
         self.num_heads = num_heads
         self.local_heads = local_heads
         self.n_rep = num_heads//local_heads
-        self.mq_dim = self.dim // num_heads
-        self.mkv_dim = self.mq_dim*self.local_heads
+        self.head_dim = self.dim // num_heads
+    
 
-        self.wo = nn.Linear(self.dim, self.dim,bias=False)
+        # self.wo = nn.Linear(self.dim, self.dim,bias=False)
 
-        self.proj_lif = MultiStepLIFNode(decay_input=False,v_reset=0.,detach_reset=True, backend='cupy',)
+        self.proj_lif = LIFNode(v_reset=0.,detach_reset=True, backend='torch',decay_input=False)
         
-        self.q_w = nn.Linear(self.dim, self.dim, bias=False)
-        self.q_lif = MultiStepLIFNode(decay_input=False,v_reset=0.,detach_reset=True, backend='cupy',)
+        self.q_w = nn.Linear(self.dim, self.head_dim*num_heads, bias=False)
+        self.q_lif = LIFNode(v_reset=0.,detach_reset=True, backend='torch',decay_input=False)
 
-        self.k_w = nn.Linear(self.dim,self.mkv_dim, bias=False)
-        self.k_lif = MultiStepLIFNode(decay_input=False,v_reset=0.,detach_reset=True, backend='cupy',)
+        self.k_w = nn.Linear(self.dim,self.head_dim*local_heads, bias=False)
+        self.k_lif = LIFNode(v_reset=0.,detach_reset=True, backend='torch',decay_input=False)
 
-        self.v_w = nn.Linear(self.dim,self.mkv_dim, bias=False)
-        self.v_lif = MultiStepLIFNode(decay_input=False,v_reset=0.,detach_reset=True, backend='cupy',)
+        self.v_w = nn.Linear(self.dim,self.head_dim*local_heads, bias=False)
+        self.v_lif = LIFNode(v_reset=0.,detach_reset=True, backend='torch',decay_input=False)
 
-        self.enable_amp = enable_amp
+        self.attn_lif = LIFNode(v_reset=0.,detach_reset=True, backend='torch',decay_input=False)
+        self.proj_w = nn.Linear(self.dim, self.dim,bias=False)
+        self.proj_ln = nn.LayerNorm(dim)
 
-    def inner_forward(self, x):
+    def forward(self, x,freqs_cis):
 
         T, B, C, N= x.shape
 
@@ -219,65 +217,68 @@ class SpikingSelfAttention(nn.Module):
         v_w_out = self.v_w(x_for_qkv)
         
         q_w_out = self.q_lif(q_w_out) #T,B,C,N
-        q = q_w_out.reshape(T,B,C,self.num_heads, -1).permute(0,1,3,2,4) # T,B,HEADS,C,mq_dim
+        q = q_w_out.reshape(T*B,C,self.num_heads, -1) # T,B,HEADS,C,mq_dim
 
         k_w_out = self.k_lif(k_w_out)
-        k = k_w_out.reshape(T,B,C,self.local_heads, -1)# T,B,Local_HEADS,C,mq_dim
-        k = repeat_kv(k,self.n_rep).permute(0, 1, 3, 2, 4) #T,B,C,HEADS,mq_dim  -> T,B,HEADS,C,mq_dim
-
+        k = k_w_out.reshape(T*B,C,self.local_heads, -1)# T,B,Local_HEADS,C,mq_dim
         v_w_out = self.v_lif(v_w_out)
         v = v_w_out.reshape(T,B,C,self.local_heads, -1)# T,B,Local_HEADS,C,mq_dim
+
+        q, k = apply_rotary_emb(q, k, freqs_cis=freqs_cis)
+        q = q.reshape(T,B,*q.shape[1:]).permute(0, 1, 3, 2, 4)
+        k = k.reshape(T,B,*k.shape[1:])
+        k = repeat_kv(k,self.n_rep).permute(0, 1, 3, 2, 4) #T,B,C,HEADS,mq_dim  -> T,B,HEADS,C,mq_dim
         v = repeat_kv(v,self.n_rep).permute(0, 1, 3, 2, 4) #T,B,C,HEADS,mq_dim  -> T,B,HEADS,C,mq_dim
+
+        
 
 
         attn = (q @ k.transpose(-2, -1)) # T,B,num_heads,N,C//num_heads * # T,B,num_heads,C//num_heads,N
-        scores = attn
-        output = torch.matmul(scores, v)  # (T,bs, n_local_heads, seqlen, head_dim)
-        x = output
-        x = x.transpose(3, 4).reshape(T,B,self.dim,-1).contiguous().transpose(2, 3)
-        x = self.wo(x)
+        output = torch.matmul(attn, v)  # (T,bs, n_local_heads, seqlen, head_dim)
+        output = output.transpose(3, 4).reshape(T,B,self.dim,-1).contiguous().transpose(2, 3)
+        # output = self.wo(output)
+        output = self.attn_lif(output)
+        output = output.flatten(0,1)
+        output = self.proj_ln(self.proj_w(output)).reshape(T,B,C,-1)
 
-        return x
+        return output
 
-    def forward(self, x):
-        with torch.cuda.amp.autocast(enabled=self.enable_amp):
-            return self.inner_forward(x)
 
 class blk(nn.Module):
-    def __init__(self,T,dim,num_heads,local_heads,enable_amp=False) :
+    def __init__(self,T,dim,num_heads,local_heads,max_seq_len) :
         super().__init__()
         self.att = SpikingSelfAttention(dim=dim,
-                                       num_heads=num_heads,local_heads=local_heads,
-                                       enable_amp=enable_amp,)
-        self.mlp = MLP(dim=dim,  enable_amp=enable_amp)
+                                       num_heads=num_heads,local_heads=local_heads)
+        self.mlp = MLP(dim=dim)
         self.att_norm = RMSNorm(dim, eps=1e-5)
         self.mlp_norm = RMSNorm(dim, eps=1e-5)
         self.theta_norm = RMSNorm(dim, eps=1e-5)
-        self.enable_amp = enable_amp
 
         self.adaLN_modulation = nn.Sequential(
             nn.SiLU(),
             nn.Linear(dim, 6 * dim, bias=True)
         )
-
+        self.max_seq_len = max_seq_len
         self.re_token = nn.Parameter(torch.ones((T,1,dim)))
-    
-    def forward(self,x,c):
-        with torch.cuda.amp.autocast(enabled=self.enable_amp): 
-            T,B,C,D = x.shape   
-            shift_msa, scale_msa, gate_msa, shift_mlp, scale_mlp, gate_mlp = self.adaLN_modulation(c).chunk(6, dim=1)    
-            x = torch.concat([x,self.re_token[:,None,:,:].expand((T,B,1,D))],dim=2)     
 
-            x = x + gate_msa.unsqueeze(1) * self.att(modulate(self.att_norm(x),shift_msa, scale_msa))    
-            x = x + gate_mlp.unsqueeze(1) * self.mlp(modulate(self.mlp_norm(x), shift_mlp, scale_mlp))        
 
-            x,theta = torch.split(x,dim=2,split_size_or_sections=[C,1])
-            x = x + self.theta_norm(x*theta)
+
+    def forward(self,x,c,freqs_cis):
+
+        T,B,C,D = x.shape   
+        shift_msa, scale_msa, gate_msa, shift_mlp, scale_mlp, gate_mlp = self.adaLN_modulation(c).chunk(6, dim=1)    
+        x = torch.concat([x,self.re_token[:,None,:,:].expand((T,B,1,D))],dim=2)     
+
+        x = x + gate_msa.unsqueeze(1) * self.att(modulate(self.att_norm(x),shift_msa, scale_msa),freqs_cis=freqs_cis)    
+        x = x + gate_mlp.unsqueeze(1) * self.mlp(modulate(self.mlp_norm(x), shift_mlp, scale_mlp))        
+
+        x,theta = torch.split(x,dim=2,split_size_or_sections=[C,1])
+        x = x + self.theta_norm(x*theta)
         return x
 
 class FinalLayer(nn.Module):
     """
-    The final layer of DiT.
+    The final layer of SDiT.
     """
     def __init__(self, hidden_size, patch_size, out_channels):
         super().__init__()
@@ -351,11 +352,40 @@ class PatchEmbed(nn.Module):
         embedding = self.norm(x).reshape(T,B,N,D)
         return embedding
 
+class LabelEmbedder(nn.Module):
+    """
+    Embeds class labels into vector representations. Also handles label dropout for classifier-free guidance.
+    """
+    def __init__(self, num_classes, hidden_size, dropout_prob):
+        super().__init__()
+        use_cfg_embedding = dropout_prob > 0
+        self.embedding_table = nn.Embedding(num_classes + use_cfg_embedding, hidden_size)
+        self.num_classes = num_classes
+        self.dropout_prob = dropout_prob
+
+    def token_drop(self, labels, force_drop_ids=None):
+        """
+        Drops labels to enable classifier-free guidance.
+        """
+        if force_drop_ids is None:
+            drop_ids = torch.rand(labels.shape[0], device=labels.device) < self.dropout_prob
+        else:
+            drop_ids = force_drop_ids == 1
+        labels = torch.where(drop_ids, self.num_classes, labels)
+        return labels
+
+    def forward(self, labels, train, force_drop_ids=None):
+        use_dropout = self.dropout_prob > 0
+        if (train and use_dropout) or (force_drop_ids is not None):
+            labels = self.token_drop(labels, force_drop_ids)
+        embeddings = self.embedding_table(labels)
+        return embeddings
+
 class transformer_snn(nn.Module):
     def __init__(self, input_size=28,patch_size=4,in_channels=3,
                   num_classes=10,
                  embed_dim=384, num_heads=8,local_heads=2, 
-                 depths=2, T=4,  learn_sigma=True,enable_amp=False
+                 depths=2, T=4,  learn_sigma=True,enable_amp = False
                  ):
         super().__init__()
         assert (input_size * input_size) // (patch_size ** 2) 
@@ -363,20 +393,27 @@ class transformer_snn(nn.Module):
         self.num_classes = num_classes
         self.in_channels = in_channels
         self.out_channels = in_channels * 2 if learn_sigma else in_channels
-        self.ctx_len = int(input_size * input_size / patch_size ** 2)
+        self.max_seq_len = int(input_size * input_size / patch_size ** 2)
         self.depths = depths
         self.T = T
+        self.enable_amp = enable_amp
 
         self.layers = nn.ModuleList()
         for j in range(0, depths):
-            self.layers.append(blk(T=self.T,dim=embed_dim,local_heads=local_heads,
-                  num_heads=num_heads, enable_amp=enable_amp,))
+            self.layers.append(blk(T=self.T,dim=embed_dim,local_heads=local_heads,max_seq_len=self.max_seq_len,
+                  num_heads=num_heads))
             
         self.x_embedder = PatchEmbed(in_channels=in_channels, patch_size=patch_size,embed_dim=embed_dim)
         self.t_embedder = TimestepEmbedder(embed_dim)
+        self.y_embedder = LabelEmbedder(num_classes, embed_dim, 0.1)
         self.final_layer = FinalLayer(embed_dim, patch_size, self.out_channels)
-        self.pos_embed = nn.Parameter(torch.zeros(self.T,1, self.ctx_len, embed_dim), requires_grad=False)
-
+        # self.pos_embed = nn.Parameter(torch.zeros(T,1, self.ctx_len, embed_dim), requires_grad=False)
+        self.freqs_cis = precompute_freqs_cis(
+                # Note that self.params.max_seq_len is multiplied by 2 because the token limit for the Llama 2 generation of models is 4096. 
+                # Adding this multiplier instead of using 4096 directly allows for dynamism of token lengths while training or fine-tuning.
+                embed_dim // num_heads, self.max_seq_len+1
+            ).cuda()
+        self.final_conv = nn.Conv2d(self.out_channels, self.out_channels, 3, padding=1) 
         self._init_weights()
 
     def unpatchify(self, x):
@@ -402,8 +439,8 @@ class transformer_snn(nn.Module):
                     nn.init.constant_(module.bias, 0)
         self.apply(_basic_init)
 
-        pos_embed = get_2d_sincos_pos_embed(self.pos_embed.shape[-1], int(self.ctx_len ** 0.5))
-        self.pos_embed.data.copy_(torch.from_numpy(pos_embed).float().unsqueeze(0))
+        # pos_embed = get_2d_sincos_pos_embed(self.pos_embed.shape[-1], int(self.ctx_len ** 0.5))
+        # self.pos_embed.data.copy_(torch.from_numpy(pos_embed).float().unsqueeze(0))
 
         w = self.x_embedder.projection.weight.data
         nn.init.xavier_uniform_(w.view([w.shape[0], -1]))
@@ -417,30 +454,51 @@ class transformer_snn(nn.Module):
         for block in self.layers:
             nn.init.constant_(block.adaLN_modulation[-1].weight, 0)
             nn.init.constant_(block.adaLN_modulation[-1].bias, 0)
+        # Initialize label embedding table:
+        nn.init.normal_(self.y_embedder.embedding_table.weight, std=0.02)
 
         # Zero-out output layers:
         nn.init.constant_(self.final_layer.adaLN_modulation[-1].weight, 0)
         nn.init.constant_(self.final_layer.adaLN_modulation[-1].bias, 0)
 
 
-    def forward(self, x, t):
-        # B,C,H,W
-        x = x[None,:,:,:,:].repeat(self.T,1,1,1,1) # T,B,N,D
-        x = self.x_embedder(x)  + self.pos_embed  # T,B,N,D
-        t = self.t_embedder(t)                   # (B, D)
-        c = t
+    def forward(self, x, t, y):
+        with torch.cuda.amp.autocast(enabled=self.enable_amp):
+            # B,C,H,W
+            x = x[None,:,:,:,:].repeat(self.T,1,1,1,1) # T,B,N,D
+            # x = self.x_embedder(x)  + self.pos_embed  # T,B,N,D
+            x = self.x_embedder(x)
+            t = self.t_embedder(t)                   # (B, D)
+            y = self.y_embedder(y,self.training)
+            c = t + y 
 
-        for block in self.layers:
-            x = block(x,c)                      # (T, B, N, D)
+            for block in self.layers:
+                x = block(x,c,freqs_cis=self.freqs_cis)                      # (T, B, N, D)
 
-        x = x.mean(0)
-        x = self.final_layer(x,c)                # (B, N, patch_size ** 2 * out_channels)
-        x = self.unpatchify(x)                   # (B, out_channels, H, W)
-
-        reset_net(self)
+            x = x.mean(0)
+            x = self.final_layer(x,c)                # (B, N, patch_size ** 2 * out_channels)
+            x = self.unpatchify(x)                   # (B, out_channels, H, W)
+            x = self.final_conv(x)
+            reset_net(self)
         return x
 
-
+    def forward_with_cfg(self, x, t, y, cfg_scale):
+        """
+        Forward pass of DiT, but also batches the unconditional forward pass for classifier-free guidance.
+        """
+        # https://github.com/openai/glide-text2im/blob/main/notebooks/text2im.ipynb
+        half = x[: len(x) // 2]
+        combined = torch.cat([half, half], dim=0)
+        model_out = self.forward(combined, t, y)
+        # For exact reproducibility reasons, we apply classifier-free guidance on only
+        # three channels by default. The standard approach to cfg applies it to all channels.
+        # This can be done by uncommenting the following line and commenting-out the line following that.
+        # eps, rest = model_out[:, :self.in_channels], model_out[:, self.in_channels:]
+        eps, rest = model_out[:, :3], model_out[:, 3:]
+        cond_eps, uncond_eps = torch.split(eps, len(eps) // 2, dim=0)
+        half_eps = uncond_eps + cfg_scale * (cond_eps - uncond_eps)
+        eps = torch.cat([half_eps, half_eps], dim=0)
+        return torch.cat([eps, rest], dim=1)
 #################################################################################
 #                   Sine/Cosine Positional Embedding Functions                  #
 #################################################################################
@@ -499,5 +557,6 @@ if __name__ == "__main__":
     model = transformer_snn().cuda()
     x = torch.randn((4,3,28,28)).cuda()
     t = torch.randint(0, 1000, (x.shape[0],), device='cuda')
-    output = model(x,t)
+    y = torch.randint(0, 1, (x.shape[0],), device='cuda')
+    output = model(x,t,y)
     print(output.shape)
