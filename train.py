@@ -1,3 +1,9 @@
+# Copyright (c) Meta Platforms, Inc. and affiliates.
+# All rights reserved.
+
+# This source code is licensed under the license found in the
+# LICENSE file in the root directory of this source tree.
+
 import os
 # os.environ['CUDA_IS_VISIABLE'] = '2'
 import shutil
@@ -25,15 +31,7 @@ from tqdm import tqdm
 from diffusion import create_diffusion
 import torchvision
 from SDiT import transformer_snn
-# from SDiT_noASM import transformer_snn
 from torch.cuda.amp import autocast as autocast
-# try:
-#     # 5678 is the default attach port in the VS Code debug configurations. Unless a host and port are specified, host defaults to 127.0.0.1
-#     debugpy.listen(("localhost", 9501))
-#     print("Waiting for debugger attach")
-#     debugpy.wait_for_client()
-# except Exception as e:
-#     pass
 
 #################################################################################
 #                             Training Helper Functions                         #
@@ -48,6 +46,7 @@ def update_ema(ema_model, model, decay=0.9999):
     model_params = OrderedDict(model.named_parameters())
 
     for name, param in model_params.items():
+        # TODO: Consider applying only to params that require_grad to avoid small numerical changes of pos_embed
         ema_params[name].mul_(decay).add_(param.data, alpha=1 - decay)
 
 
@@ -120,9 +119,6 @@ def broadcast_string(value, src, max_length=256):
     return buffer.cpu().numpy().tobytes().decode().rstrip('\x00')
 
 def main(args):
-    """
-    Trains a new SDiT model.
-    """
     assert torch.cuda.is_available(), "Training currently requires at least one GPU."
 
     # Setup DDP:
@@ -137,11 +133,11 @@ def main(args):
     checkpoint_dir = None
     # Setup an experiment folder:
     if rank == 0:
-        os.makedirs(args.results_dir, exist_ok=True)  # Make results folder (holds all experiment subfolders)
+        os.makedirs(args.results_dir, exist_ok=True) 
         experiment_index = len(glob(f"{args.results_dir}/*"))
-        model_string_name = args.model.replace("/", "-")  
-        experiment_dir = f"{args.results_dir}/{experiment_index:03d}-{model_string_name}"  # Create an experiment folder
-        checkpoint_dir = f"{experiment_dir}/checkpoints"  # Stores saved model checkpoints
+        model_string_name = args.model.replace("/", "-") 
+        experiment_dir = f"{args.results_dir}/{experiment_index:03d}-{model_string_name}" 
+        checkpoint_dir = f"{experiment_dir}/checkpoints" 
         os.makedirs(checkpoint_dir, exist_ok=True)
         logger = create_logger(experiment_dir)
         logger.info(f'{args}')
@@ -152,14 +148,12 @@ def main(args):
 
     # Create model:
     checkpoint_dir = broadcast_string(checkpoint_dir,0)
-    # print(checkpoint_dir)
     model = transformer_snn(input_size=args.image_size,in_channels=args.in_channels,patch_size=args.patch_size,num_classes=args.num_classes,embed_dim=args.dim,num_heads=args.heads,local_heads=args.local_heads,depths=args.depth,T=args.T,enable_amp=args.amp)
     ckpt = None
     if args.load_ckpt:
         ckpt = torch.load(args.ckpt_dir)
         model.load_state_dict(ckpt['model'])
 
-    # Note that parameter initialization is done within the SDiT constructor
     ema = deepcopy(model).to(device)  # Create an EMA of the model for use after training
     if args.load_ckpt:
         ema.load_state_dict(ckpt['ema'])
@@ -167,12 +161,13 @@ def main(args):
     model = DDP(model.to(device), device_ids=[rank])
     diffusion = create_diffusion(timestep_respacing="")  # default: 1000 steps, linear noise schedule
     sample_diffusion = create_diffusion(str(args.num_sampling_steps))
-    logger.info(f"DiT Parameters: {sum(p.numel() for p in model.parameters()):,}")
+    logger.info(f"SDiT Parameters: {sum(p.numel() for p in model.parameters()):,}")
 
     opt = torch.optim.AdamW(model.parameters(), lr=args.lr, )
     # if args.load_ckpt:
     #     opt.load_state_dict(ckpt['opt'])
     scaler = torch.cuda.amp.GradScaler()
+    # scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(opt,T_max=20,last_epoch=-1,eta_min=1e-4)
 
     # Setup data:
     SetRange = torchvision.transforms.Lambda(lambda X: 2 * X - 1.)
@@ -202,16 +197,38 @@ def main(args):
         torchvision.transforms.Resize((128,128)),        
         torchvision.transforms.ToTensor(),
         SetRange])
+    lsun_bedroom_transform = torchvision.transforms.Compose([
+        torchvision.transforms.RandomHorizontalFlip(),
+        torchvision.transforms.Resize((64,64)),
+        torchvision.transforms.ToTensor(),
+        transforms.Normalize(mean=[0.5, 0.5, 0.5], std=[0.5, 0.5, 0.5])])
+
     if args.dataset == "mnist":
         dataset = torchvision.datasets.MNIST(root=args.data_path,train=True,transform=MNIST_transform,download=False)
     elif args.dataset == "fmnist":
         dataset = torchvision.datasets.FashionMNIST(root=args.data_path,train=True,transform=FMNIST_transform,download=False)
     elif args.dataset == "cifar10":
-        dataset = torchvision.datasets.ImageFolder(root="/HDD/data/cifar10", transform=CIFAR10_transform)
+        dataset = torchvision.datasets.CIFAR10(root=args.data_path,train=True,transform=CIFAR10_transform,download=False)
     elif args.dataset == "TinyImageNet":
         dataset = torchvision.datasets.ImageFolder(root=args.data_path, transform=TinyImageNet_transform)
     elif args.dataset == "imagenet":
         dataset = ImageFolder(args.data_path, transform=imagenet_transform)
+    elif args.dataset == "bedroom":
+        dataset = torchvision.datasets.ImageFolder(root='/HDD/dataset/lsun_bedroom/', transform=lsun_bedroom_transform)
+    elif args.dataset == "church":
+        import datasets
+        dataset = datasets.load_from_disk('~/datasets/church')
+        dataset.with_format('pytorch')
+        lsun_church_transform = torchvision.transforms.Compose([
+                torchvision.transforms.RandomHorizontalFlip(),
+                torchvision.transforms.Resize((64,64)),
+                torchvision.transforms.ToTensor(),
+                torchvision.transforms.Normalize(mean=[0.5, 0.5, 0.5], std=[0.5, 0.5, 0.5])])
+        def transform_image(examples):
+            examples['image'] = [lsun_church_transform(image.convert("RGB")) for image in examples['image']]
+            return examples
+        dataset = dataset.with_transform(transform_image)
+        
     elif args.dataset == "celeba":
         dataset = torchvision.datasets.ImageFolder(root='/HDD/dataset/celeba/',transform=celeba_transform)
     elif args.dataset == "celeba-hq":
@@ -238,10 +255,11 @@ def main(args):
 
     # Prepare models for training:
     update_ema(ema, model.module, decay=0)  # Ensure EMA is initialized with synced weights
-    model.train()  # important! This enables embedding dropout for classifier-free guidance
+    last_checkpoint_path = None
+    model.train()  
     ema.eval()  # EMA model should always be in eval mode
 
-    # Variables for monitoring/logging purposes:
+
     train_steps = 0
     log_steps = 0
     running_loss = 0
@@ -256,8 +274,13 @@ def main(args):
     for epoch in range(begin_epoch,begin_epoch + args.epochs):
         sampler.set_epoch(epoch)
         logger.info(f"Beginning epoch {epoch}...")
-        for x, y in loader:
+        for data in loader:
             opt.zero_grad()
+            if args.dataset == 'church':
+                x = data['image']
+                y = data['label']
+            else:
+                x,y = data
             x = x.to(device)
             y = y.to(device)
 
@@ -276,21 +299,20 @@ def main(args):
 
             update_ema(ema, model.module)
 
-            # Log loss values:
             running_loss += loss.item()
             log_steps += 1
             train_steps += 1
             if train_steps % args.log_every == 0:
-                # Measure training speed:
+
                 torch.cuda.synchronize()
                 end_time = time()
                 steps_per_sec = log_steps / (end_time - start_time)
-                # Reduce loss history over all processes:
+
                 avg_loss = torch.tensor(running_loss / log_steps, device=device)
                 dist.all_reduce(avg_loss, op=dist.ReduceOp.SUM)
                 avg_loss = avg_loss.item() / dist.get_world_size()
                 logger.info(f"(step={train_steps:07d}) Train Loss: {avg_loss:.4f}, Train Steps/Sec: {steps_per_sec:.2f}")
-                # Reset monitoring variables:
+
                 running_loss = 0
                 log_steps = 0
                 start_time = time()
@@ -298,22 +320,24 @@ def main(args):
             # Save checkpoint:
             if train_steps % args.ckpt_every == 0 and train_steps > 0:
                 if rank == 0:
-                    save_ckpt(checkpoint_dir,train_steps,rank,model,ema,opt,args,epoch,logger)
+                    last_checkpoint_path = save_ckpt(checkpoint_dir, train_steps, rank, model, ema, opt, args, epoch, logger, last_checkpoint_path)
                 dist.barrier()
                 checkpoint_path = f"{checkpoint_dir}/{train_steps:07d}.pt"
                 sample_step(ema,sample_diffusion,checkpoint_path,args.global_batch_size,device,rank,args)
                 dist.barrier()
 
     # scheduler.step()
-    save_ckpt(checkpoint_dir,train_steps,rank,model,ema,opt,args,epoch,logger)
+    last_checkpoint_path = save_ckpt(checkpoint_dir, train_steps, rank, model, ema, opt, args, epoch, logger, last_checkpoint_path)
     dist.barrier()
     logger.info("Done!")
     cleanup()
 
 
-def save_ckpt(checkpoint_dir,train_steps,rank,model,ema,opt,args,epoch,logger):
+def save_ckpt(checkpoint_dir, train_steps, rank, model, ema, opt, args, epoch, logger, last_checkpoint_path=None):
     checkpoint_path = f"{checkpoint_dir}/{train_steps:07d}.pt"
     if rank == 0:
+        if last_checkpoint_path and os.path.exists(last_checkpoint_path):
+            os.remove(last_checkpoint_path)
         checkpoint = {
             "model": model.module.state_dict(),
             "ema": ema.state_dict(),
@@ -322,11 +346,14 @@ def save_ckpt(checkpoint_dir,train_steps,rank,model,ema,opt,args,epoch,logger):
             "args": args
         }
         torch.save(checkpoint, checkpoint_path)
+        last_checkpoint_path = checkpoint_path
         logger.info(f"Saved checkpoint to {checkpoint_path}")
+        return last_checkpoint_path
+
 
 def sample_step(model,diffusion,checkpoint_dir,num_samples,device,rank,args):
 
-    model.eval() 
+    model.eval()  # important!
     using_cfg = args.cfg_scale > 1.0
     # Create folder to save samples:
     model_string_name = args.model.replace("/", "-")
@@ -340,10 +367,8 @@ def sample_step(model,diffusion,checkpoint_dir,num_samples,device,rank,args):
         print(f"Saving .png samples at {sample_folder_dir}")
     dist.barrier()
 
-    # Figure out how many samples we need to generate on each GPU and how many iterations we need to run:
     n = int(args.global_batch_size / dist.get_world_size())
     global_batch_size = n * dist.get_world_size()
-    # To make things evenly-divisible, we'll sample a bit more than we need and then discard the extra samples:
     total_samples = int(math.ceil(num_samples / global_batch_size) * global_batch_size)
     dist.barrier()
     if rank == 0:
@@ -360,7 +385,6 @@ def sample_step(model,diffusion,checkpoint_dir,num_samples,device,rank,args):
         z = torch.randn(n, model.in_channels, model.input_size, model.input_size, device=device)
         y = torch.randint(0, args.num_classes, (n,), device=device)
 
-        # Setup classifier-free guidance:
         if using_cfg:
             z = torch.cat([z, z], 0)
             y_null = torch.tensor([args.num_classes] * n, device=device)
@@ -368,7 +392,7 @@ def sample_step(model,diffusion,checkpoint_dir,num_samples,device,rank,args):
             model_kwargs = dict(y=y, cfg_scale=args.cfg_scale)
             sample_fn = model.forward_with_cfg
         else:
-            model_kwargs = dict(y=y)
+            model_kwargs = None
             sample_fn = model.forward
 
         # Sample images:
@@ -376,10 +400,9 @@ def sample_step(model,diffusion,checkpoint_dir,num_samples,device,rank,args):
             sample_fn, z.shape, z, clip_denoised=False, model_kwargs=model_kwargs, progress=False, device=device
         )
         if using_cfg:
-            samples, _ = samples.chunk(2, dim=0)  # Remove null class samples
+            samples, _ = samples.chunk(2, dim=0)  
 
         samples = torch.clamp(127.5 * samples + 128.0, 0, 255).permute(0, 2, 3, 1).to("cpu", dtype=torch.uint8).numpy()
-        # Save samples to disk as individual .png files
         for i, sample in enumerate(samples):
             index = i * dist.get_world_size() + rank + total
             if args.dataset == "mnist" or args.dataset == "fmnist":
@@ -411,7 +434,7 @@ if __name__ == "__main__":
 
 
     parser.add_argument("--num-sampling-steps", type=int, default=250)
-    parser.add_argument("--cfg-scale",  type=float, default=1.0)
+    parser.add_argument("--cfg-scale",  type=float, default=7)
     parser.add_argument("--epochs", type=int, default=500)
     parser.add_argument("--global-batch-size", type=int, default=64)
     parser.add_argument("--global-seed", type=int, default=0)
